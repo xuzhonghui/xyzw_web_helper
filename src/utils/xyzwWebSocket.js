@@ -4,8 +4,9 @@
  */
 
 import { $CacheManager } from "@/stores/cache";
-import { bonProtocol, g_utils } from "./bonProtocol.js";
-import { wsLogger, gameLogger } from "./logger.js";
+import { g_utils } from "./bonProtocol.js";
+import { sleep } from "./helperTaskRunner.js";
+import { gameLogger, wsLogger } from "./logger.js";
 
 /**
  * 错误码映射表
@@ -69,7 +70,7 @@ const formatBodyForLog = (body) => {
 
   if (typeof body === "object") {
     const isNumericObject = Object.keys(body).every(
-      (key) => !Number.isNaN(parseInt(key)),
+      (key) => !Number.isNaN(Number.parseInt(key)),
     );
     if (isNumericObject) {
       return `[BON:Object:${Object.keys(body).length}]`;
@@ -160,6 +161,7 @@ export function registerDefaultCommands(reg) {
     .register("system_signinreward")
     .register("system_mysharecallback", { isSkipShareCard: true, type: 2 })
     .register("system_custom", { key: "", value: 0 })
+    .register("system_claimcdkreward", { key: "", platformType: "h5" })
 
     // 任务相关
     .register("task_claimdailypoint", { taskId: 1 })
@@ -192,6 +194,12 @@ export function registerDefaultCommands(reg) {
     .register("store_buy", { goodsId: 1 })
     .register("store_purchase", { goodsId: 1 })
     .register("store_refresh", { storeId: 1 })
+    .register("store_getpurchase")
+    .register("store_setpurchase", {
+      purchaseCnt: 1,
+      purchaseItemList: [],
+    })
+    .register("store_getpurchasehistory")
 
     // 军团
     .register("legion_getinfo")
@@ -209,6 +217,7 @@ export function registerDefaultCommands(reg) {
     .register("legion_resetresearch")
 
     .register("legion_getinfobyid")
+    .register("legion_applyjoin", { legionId: 0 })
     .register("legion_getarearank")
     .register("saltroad_getsaltroadwartotalrank")
     .register("legionwar_getgoldmonthwarrank")
@@ -718,7 +727,10 @@ export class XyzwWebSocketClient {
     if (typeof body === "object" && body.constructor === Object) {
       // 检查是否是数字键的对象（例如 {"0": 8, "1": 2, ...}）
       const keys = Object.keys(body);
-      return keys.length > 0 && keys.every((key) => !isNaN(parseInt(key)));
+      return (
+        keys.length > 0 &&
+        keys.every((key) => !Number.isNaN(+Number.parseInt(key)))
+      );
     }
 
     return false;
@@ -739,14 +751,14 @@ export class XyzwWebSocketClient {
     // 对象格式的数字数组转换为Uint8Array
     if (typeof body === "object" && body.constructor === Object) {
       const keys = Object.keys(body)
-        .map((k) => parseInt(k))
+        .map((k) => Number.parseInt(k))
         .sort((a, b) => a - b);
       if (keys.length > 0) {
         const maxIndex = Math.max(...keys);
-        const arr = new Array(maxIndex + 1).fill(0);
+        const arr = Array.from({ length: maxIndex + 1 }, () => 0);
         for (const [key, value] of Object.entries(body)) {
-          const index = parseInt(key);
-          if (!isNaN(index) && typeof value === "number") {
+          const index = Number.parseInt(key);
+          if (!Number.isNaN(+index) && typeof value === "number") {
             arr[index] = value;
           }
         }
@@ -881,7 +893,13 @@ export class XyzwWebSocketClient {
     return task;
   }
 
-  /** Promise 版发送 */
+  /**
+   * Queue a command and wait for its sequence or legacy command response.
+   * @param {string} cmd Registered protocol command.
+   * @param {object} params Command body.
+   * @param {number} timeoutMs Timeout measured from queue admission, in milliseconds.
+   * @returns {Promise<unknown>} Response body; rejects on a server error or timeout.
+   */
   sendWithPromise(cmd, params = {}, timeoutMs = 5000) {
     return new Promise((resolve, reject) => {
       if (!this.connected && !this.socket) {
@@ -899,6 +917,7 @@ export class XyzwWebSocketClient {
         delete this.promises[requestSeq];
         reject(new Error(`请求超时: ${cmd} (${timeoutMs}ms)`));
       }, timeoutMs);
+      this.promises[requestSeq].timer = timer;
 
       // 发送消息，直接传递seq
       this.send(cmd, params, {
@@ -1044,6 +1063,7 @@ export class XyzwWebSocketClient {
     // 优先使用resp字段进行响应匹配（新的正确方式）
     if (packet.resp !== undefined && this.promises[packet.resp]) {
       const promiseData = this.promises[packet.resp];
+      clearTimeout(promiseData.timer);
       delete this.promises[packet.resp];
 
       // 获取响应数据，优先使用 rawData（ProtoMsg 自动解码），然后 decodedBody（手动解码），最后 body
@@ -1114,6 +1134,9 @@ export class XyzwWebSocketClient {
       presetteam_getinforesp: "presetteam_getinfo",
       mail_claimallattachmentresp: "mail_claimallattachment",
       store_buyresp: "store_purchase",
+      store_getpurchaseresp: "store_getpurchase",
+      store_setpurchaseresp: "store_setpurchase",
+      store_getpurchasehistoryresp: "store_getpurchasehistory",
       system_getdatabundleverresp: "system_getdatabundlever",
       tower_claimrewardresp: "tower_claimreward",
       fight_starttowerresp: "fight_starttower",
@@ -1140,6 +1163,7 @@ export class XyzwWebSocketClient {
       warguess_getguesscoinrewardresp: "warguess_getguesscoinreward",
       league_getbattlefieldresp: "league_getbattlefield",
       league_getgroupopponentresp: "league_getgroupopponent",
+      legion_applyjoinresp: "legion_applyjoin",
       legion_signupresp: "legion_signup",
       legion_payloadsignupresp: "legion_payloadsignup",
       legionmatch_rolesignupresp: "legionmatch_rolesignup",
@@ -1180,7 +1204,6 @@ export class XyzwWebSocketClient {
       activity_getlotteryinforesp: "activity_getlotteryinfo",
       activity_lotteryresp: "activity_lottery",
       activity_rewardresp: "activity_claimsignreward",
-      arena_getarearankresp: "arena_getarearank",
       bosstower_gethelprankresp: "bosstower_gethelprank",
       // 功法相关响应映射
       legacy_getinforesp: "legacy_getinfo",
@@ -1219,6 +1242,7 @@ export class XyzwWebSocketClient {
         "genie_sweep",
         "genie_buysweep",
         "system_signinreward",
+        "system_claimcdkreward",
         "dungeon_selecthero",
         "artifact_exchange",
         "hero_exchange",
@@ -1239,6 +1263,7 @@ export class XyzwWebSocketClient {
     for (const [requestId, promiseData] of Object.entries(this.promises)) {
       // 检查 Promise 是否匹配当前响应的任一原始命令
       if (originalCmds.includes(promiseData.originalCmd)) {
+        clearTimeout(promiseData.timer);
         delete this.promises[requestId];
 
         // 获取响应数据，优先使用 rawData（ProtoMsg 自动解码），然后 decodedBody（手动解码），最后 body
@@ -1272,6 +1297,11 @@ export class XyzwWebSocketClient {
 
   /** 清理定时器 */
   _clearTimers() {
+    for (const [id, request] of Object.entries(this.promises)) {
+      clearTimeout(request.timer);
+      delete this.promises[id];
+      request.reject(new Error("WebSocket 连接已关闭"));
+    }
     if (this.heartbeatTimer) {
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = null;

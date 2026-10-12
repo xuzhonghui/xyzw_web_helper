@@ -5,8 +5,8 @@
 
 /**
  * 创建挂机、答题、签到类任务执行器
- * @param {Object} deps - 依赖项
- * @returns {Object} 任务函数集合
+ * @param {object} deps - 依赖项
+ * @returns {object} 任务函数集合
  */
 export function createTasksHangUp(deps) {
   const {
@@ -200,7 +200,8 @@ export function createTasksHangUp(deps) {
     });
 
     // Preload questions
-    const { preloadQuestions } = await import("@/utils/studyQuestionsFromJSON.js");
+    const { preloadQuestions } =
+      await import("@/utils/studyQuestionsFromJSON.js");
     addLog({
       time: new Date().toLocaleTimeString(),
       message: `正在加载题库...`,
@@ -386,6 +387,191 @@ export function createTasksHangUp(deps) {
     message.success("批量俱乐部签到结束");
   };
 
+  const normalizeLegionPreview = (response, fallbackLegionId = 0) => {
+    const raw =
+      response?.legionData || response?.info || response?.legionInfo || null;
+    if (!raw) return null;
+
+    const members = raw.members || {};
+    const memberCount =
+      raw.memberCount ||
+      raw.memNum ||
+      raw.memberNum ||
+      raw.num ||
+      Object.keys(members).length ||
+      0;
+
+    return {
+      id: Number(raw.id || raw.legionId || fallbackLegionId || 0),
+      name: raw.name || raw.legionName || "未知俱乐部",
+      logo: raw.logo || raw.icon || raw.headImg || raw.badge || "",
+      level: Number(raw.level || raw.lv || 0),
+      memberCount: Number(memberCount || 0),
+      chairmanName:
+        raw.chairmanName ||
+        raw.leaderName ||
+        raw.masterName ||
+        raw.ownerName ||
+        "",
+      notice: raw.notice || raw.declaration || raw.announcement || "",
+      raw,
+    };
+  };
+
+  const extractRoleLegionId = (roleInfo) => {
+    const role =
+      roleInfo?.role || roleInfo?.roleInfo?.role || roleInfo?.roleInfo || {};
+    const legionId =
+      role.legionId ??
+      role.legionID ??
+      role.clubId ??
+      role.clubID ??
+      role.guildId ??
+      role.guildID ??
+      0;
+    return Number(legionId || 0);
+  };
+
+  const queryLegionById = async (tokenId, legionId) => {
+    const normalizedLegionId = Number(legionId);
+    if (!normalizedLegionId) {
+      throw new Error("俱乐部ID无效");
+    }
+
+    const response = await tokenStore.sendMessageWithPromise(
+      tokenId,
+      "legion_getinfobyid",
+      { legionId: normalizedLegionId },
+      5000,
+    );
+
+    const preview = normalizeLegionPreview(response, normalizedLegionId);
+    if (!preview?.id) {
+      throw new Error("未查询到俱乐部信息");
+    }
+
+    return preview;
+  };
+
+  /**
+   * 批量申请俱乐部
+   * @param {number|string} legionId - 目标俱乐部ID
+   */
+  const batchApplyLegion = async (legionId) => {
+    const targetLegionId = Number(legionId);
+
+    if (selectedTokens.value.length === 0) {
+      message.warning("请先选择账号");
+      return;
+    }
+
+    if (!targetLegionId) {
+      message.warning("请先输入目标俱乐部ID");
+      return;
+    }
+
+    isRunning.value = true;
+    shouldStop.value = false;
+
+    selectedTokens.value.forEach((id) => {
+      tokenStatus.value[id] = "waiting";
+    });
+
+    const taskPromises = selectedTokens.value.map(async (tokenId) => {
+      if (shouldStop.value) return;
+
+      tokenStatus.value[tokenId] = "running";
+      const token = tokens.value.find((t) => t.id === tokenId);
+
+      try {
+        addLog({
+          time: new Date().toLocaleTimeString(),
+          message: `=== 开始申请俱乐部: ${token.name} -> ${targetLegionId} ===`,
+          type: "info",
+        });
+
+        await ensureConnection(tokenId);
+
+        const targetLegion = await queryLegionById(tokenId, targetLegionId);
+        const roleInfo = await tokenStore.sendMessageWithPromise(
+          tokenId,
+          "role_getroleinfo",
+          {},
+          5000,
+        );
+
+        const currentLegionId = extractRoleLegionId(roleInfo);
+        if (currentLegionId > 0) {
+          if (currentLegionId === targetLegionId) {
+            addLog({
+              time: new Date().toLocaleTimeString(),
+              message: `=== ${token.name} 已在目标俱乐部 [${targetLegion.name}] 中，跳过 ===`,
+              type: "warning",
+            });
+          } else {
+            addLog({
+              time: new Date().toLocaleTimeString(),
+              message: `=== ${token.name} 当前已加入其他俱乐部 (${currentLegionId})，跳过 ===`,
+              type: "warning",
+            });
+          }
+          tokenStatus.value[tokenId] = "completed";
+          return;
+        }
+
+        await tokenStore.sendMessageWithPromise(
+          tokenId,
+          "legion_applyjoin",
+          { legionId: targetLegionId },
+          5000,
+        );
+
+        addLog({
+          time: new Date().toLocaleTimeString(),
+          message: `=== ${token.name} 已向 [${targetLegion.name}] 发起申请 ===`,
+          type: "success",
+        });
+        tokenStatus.value[tokenId] = "completed";
+      } catch (error) {
+        console.error(error);
+        const errorMessage = error?.message || "未知错误";
+
+        if (
+          errorMessage.includes("已加入") ||
+          errorMessage.includes("已经加入") ||
+          errorMessage.includes("当前已加入")
+        ) {
+          tokenStatus.value[tokenId] = "completed";
+          addLog({
+            time: new Date().toLocaleTimeString(),
+            message: `=== ${token.name} 已加入俱乐部，跳过申请 ===`,
+            type: "warning",
+          });
+        } else {
+          tokenStatus.value[tokenId] = "failed";
+          addLog({
+            time: new Date().toLocaleTimeString(),
+            message: `${token.name} 申请俱乐部失败: ${errorMessage}`,
+            type: "error",
+          });
+        }
+      } finally {
+        tokenStore.closeWebSocketConnection(tokenId);
+        releaseConnectionSlot();
+        addLog({
+          time: new Date().toLocaleTimeString(),
+          message: `${token.name} 连接已关闭`,
+          type: "info",
+        });
+      }
+    });
+
+    await Promise.all(taskPromises);
+    isRunning.value = false;
+    currentRunningTokenId.value = null;
+    message.success("批量申请俱乐部结束");
+  };
+
   /**
    * 月赛助威
    * @param {number} legionId - 俱乐部ID
@@ -400,7 +586,7 @@ export function createTasksHangUp(deps) {
       message.warning("请选择要助威的俱乐部");
       return;
     }
-    
+
     isRunning.value = true;
     shouldStop.value = false;
 
@@ -419,14 +605,14 @@ export function createTasksHangUp(deps) {
           type: "info",
         });
         await ensureConnection(tokenId);
-        
+
         // 尝试领取拍手器
         try {
           const rewardRes = await tokenStore.sendMessageWithPromise(
             tokenId,
             "warguess_getguesscoinreward",
             {},
-            3000 // 短超时，因为这不是关键步骤
+            3000, // 短超时，因为这不是关键步骤
           );
           if (rewardRes && rewardRes.reward) {
             addLog({
@@ -444,7 +630,7 @@ export function createTasksHangUp(deps) {
         const rankRes = await tokenStore.sendMessageWithPromise(
           tokenId,
           "warguess_getrank",
-          { bfId: '' },
+          { bfId: "" },
           5000,
         );
 
@@ -456,63 +642,69 @@ export function createTasksHangUp(deps) {
           } else {
             list = Object.values(rankRes.list);
           }
-          totalGuessNum = list.reduce((sum, item) => sum + (item.guessNum || 0), 0);
+          totalGuessNum = list.reduce(
+            (sum, item) => sum + (item.guessNum || 0),
+            0,
+          );
         }
 
         if (totalGuessNum === 20) {
-             addLog({
-                time: new Date().toLocaleTimeString(),
-                message: `=== ${token.name} 助威次数已满 (${totalGuessNum}/20)，跳过 ===`,
-                type: "warning",
-              });
-             tokenStatus.value[tokenId] = "completed";
-             return;
+          addLog({
+            time: new Date().toLocaleTimeString(),
+            message: `=== ${token.name} 助威次数已满 (${totalGuessNum}/20)，跳过 ===`,
+            type: "warning",
+          });
+          tokenStatus.value[tokenId] = "completed";
+          return;
         }
 
         let coinToUse = Number(guessCoin);
         const remaining = 20 - totalGuessNum;
-        
+
         if (coinToUse > remaining) {
-            addLog({
-                time: new Date().toLocaleTimeString(),
-                message: `=== ${token.name} 剩余助威次数不足，调整为 ${remaining} 次 (原计划: ${coinToUse}) ===`,
-                type: "info",
-            });
-            coinToUse = remaining;
+          addLog({
+            time: new Date().toLocaleTimeString(),
+            message: `=== ${token.name} 剩余助威次数不足，调整为 ${remaining} 次 (原计划: ${coinToUse}) ===`,
+            type: "info",
+          });
+          coinToUse = remaining;
         }
 
         if (coinToUse <= 0) {
-             tokenStatus.value[tokenId] = "completed";
-             return;
+          tokenStatus.value[tokenId] = "completed";
+          return;
         }
 
         const result = await tokenStore.sendMessageWithPromise(
           tokenId,
           "warguess_startguess",
-          { guessCoin: coinToUse, legionId: legionId },
+          { guessCoin: coinToUse, legionId },
           5000,
         );
 
         if (result && result.guessLegion) {
-             addLog({
-                time: new Date().toLocaleTimeString(),
-                message: `=== ${token.name} 助威成功 (当前次数: ${result.guessLegion.guessNum}/20) ===`,
-                type: "success",
-              });
-             tokenStatus.value[tokenId] = "completed";
+          addLog({
+            time: new Date().toLocaleTimeString(),
+            message: `=== ${token.name} 助威成功 (当前次数: ${result.guessLegion.guessNum}/20) ===`,
+            type: "success",
+          });
+          tokenStatus.value[tokenId] = "completed";
         } else {
-             addLog({
-                time: new Date().toLocaleTimeString(),
-                message: `=== ${token.name} 助威失败 ===`,
-                type: "error",
-              });
-             tokenStatus.value[tokenId] = "failed";
+          addLog({
+            time: new Date().toLocaleTimeString(),
+            message: `=== ${token.name} 助威失败 ===`,
+            type: "error",
+          });
+          tokenStatus.value[tokenId] = "failed";
         }
       } catch (error) {
         console.error(error);
-        
+
         // Handle specific error: 400000 - Item does not exist (feature locked)
-        if (error.code === 400000 || (error.message && error.message.includes("400000"))) {
+        if (
+          error.code === 400000 ||
+          (error.message && error.message.includes("400000"))
+        ) {
           tokenStatus.value[tokenId] = "completed"; // Mark as completed (skipped)
           addLog({
             time: new Date().toLocaleTimeString(),
@@ -549,6 +741,8 @@ export function createTasksHangUp(deps) {
     batchAddHangUpTime,
     batchStudy,
     batchclubsign,
+    batchApplyLegion,
     batchWarGuessCheer,
+    queryLegionById,
   };
 }
